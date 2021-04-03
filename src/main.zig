@@ -9,11 +9,62 @@ pub const IRCErrors = error{
     EmptyMessage,
     MissingCommand,
     MissingCrlf,
+    InvalidCommand,
+};
+
+pub const Command = union(enum) {
+    notice,
+    nick,
+    user,
+    ping,
+    pong,
+    privmsg,
+    code: i32,
+
+    const Self = @This();
+
+    pub fn parse(raw: []const u8) !Self {
+        if (std.mem.eql(u8, raw, "NOTICE")) {
+            return Self.notice;
+        }
+        if (std.mem.eql(u8, raw, "NICK")) {
+            return Self.nick;
+        }
+        if (std.mem.eql(u8, raw, "USER")) {
+            return Self.user;
+        }
+        if (std.mem.eql(u8, raw, "PING")) {
+            return Self.ping;
+        }
+        if (std.mem.eql(u8, raw, "PONG")) {
+            return Self.pong;
+        }
+        if (std.mem.eql(u8, raw, "PRIVMSG")) {
+            return Self.privmsg;
+        }
+
+        var code = std.fmt.parseInt(i32, raw, 10) catch {
+            return error.InvalidCommand;
+        };
+        return Self{ .code = code };
+    }
+
+    pub fn to_string(self: Self, _writer: anytype) !void {
+        switch (self) {
+            .notice => _ = try _writer.write("NOTICE"),
+            .nick => _ = try _writer.write("NICK"),
+            .user => _ = try _writer.write("USER"),
+            .ping => _ = try _writer.write("PING"),
+            .pong => _ = try _writer.write("PONG"),
+            .privmsg => _ = try _writer.write("PRIVMSG"),
+            .code => |code| try std.fmt.format(_writer, "{}", .{code}),
+        }
+    }
 };
 
 const Message = struct {
     prefix: ?[]const u8,
-    command: []const u8,
+    command: Command,
     args: std.ArrayList([]const u8),
 
     const Self = @This();
@@ -80,7 +131,7 @@ const Message = struct {
 
         return Message{
             .prefix = prefix,
-            .command = command.text,
+            .command = try Command.parse(command.text),
             .args = args,
         };
     }
@@ -106,14 +157,18 @@ const IrcClient = struct {
     }
 
     pub fn read_message(self: *Self, buff: []u8) !?Message {
-        var read = try self.stream.read(buff);
-
-        if (read <= 2 or buff[read - 2] != '\r' or buff[read - 1] != '\n') {
+        var read = try self.stream.reader().readUntilDelimiterOrEof(buff, '\r');
+        if ('\n' != try self.stream.reader().readByte()) {
             return error.MissingCrlf;
         }
 
-        const message = try Message.parse(buff[0..(read - 2)], self.allocator);
-        return message;
+        if (read) |text| {
+            //std.debug.print("{any}\n", .{text});
+            const message = try Message.parse(text, self.allocator);
+            return message;
+        } else {
+            return null;
+        }
     }
 
     pub fn write_message(self: *Self, message: Message) !void {
@@ -122,7 +177,8 @@ const IrcClient = struct {
             _ = try self.stream.write(prefix);
             _ = try self.stream.write(" ");
         }
-        _ = try self.stream.write(message.command);
+        var writer = self.stream.writer();
+        try message.command.to_string(writer);
         var i: usize = 0;
         while (i < message.args.items.len) : (i += 1) {
             _ = try self.stream.write(" ");
@@ -132,20 +188,21 @@ const IrcClient = struct {
     }
 };
 
-fn reader(client: *IrcClient, allocator: *std.mem.Allocator) !void {
-    std.log.warn("reader()", .{});
+fn reader_loop(client: *IrcClient, allocator: *std.mem.Allocator) !void {
     const buff: []u8 = try allocator.alloc(u8, 5120);
+    var str = std.ArrayList(u8).init(allocator);
+    defer str.deinit();
+
     while (true) {
-        std.log.warn("reader(): reading message from stream", .{});
         var frame = async client.read_message(buff);
         var message = await frame catch |err| {
-            std.debug.warn("{any}\n", .{buff});
-            std.debug.warn("'{s}'\n", .{buff});
-            std.debug.warn("Failed to parse message: {}\n", .{err});
+            std.debug.warn("Failed to parse message: {}\n'{s}'\n", .{ err, buff });
             continue;
         };
         if (message) |msg| {
-            std.debug.print(":{s} {s}", .{ msg.prefix, msg.command });
+            try str.resize(0);
+            try msg.command.to_string(str.writer());
+            std.debug.print(":{s} {s}", .{ msg.prefix, str.items });
             var i: usize = 0;
             while (i < msg.args.items.len) : (i += 1) {
                 std.debug.print(" '{s}'", .{msg.args.items[i]});
@@ -155,13 +212,12 @@ fn reader(client: *IrcClient, allocator: *std.mem.Allocator) !void {
     }
 }
 
-fn writer(client: *IrcClient, allocator: *std.mem.Allocator) !void {
+fn writer_loop(client: *IrcClient, allocator: *std.mem.Allocator) !void {
     const stdin = std.io.getStdIn().reader();
     const buff: []u8 = try allocator.alloc(u8, 5120);
     while (true) {
-        std.log.info("writer(): reading stdin... ", .{});
         if (try stdin.readUntilDelimiterOrEof(buff, '\n')) |line| {
-            const message = Message.parse(":Nimaoth USER Nico irc.nimaoth.com tutorial.ubuntu.com :NO", allocator) catch |err| {
+            const message = Message.parse(line, allocator) catch |err| {
                 std.log.warn("Failed to parse input as message: {}", .{err});
                 continue;
             };
@@ -181,11 +237,11 @@ pub fn main() anyerror!void {
     var client = try IrcClient.init("127.0.0.1", 6697, allocator);
     defer client.deinit();
 
-    try client.write_message((Message.parse("NICK Nimaoth", allocator) catch unreachable) orelse unreachable);
-    try client.write_message((Message.parse(":Nimaoth USER Nico irc.nimaoth.com tutorial.ubuntu.com :NO", allocator) catch unreachable) orelse unreachable);
+    try client.write_message((Message.parse("NICK tuser", allocator) catch unreachable) orelse unreachable);
+    try client.write_message((Message.parse(":tuser USER Tuser irc.nimaoth.com tutorial.ubuntu.com :NO", allocator) catch unreachable) orelse unreachable);
 
-    var reader_frame = async reader(&client, allocator);
-    var writer_frame = async writer(&client, allocator);
+    var reader_frame = async reader_loop(&client, allocator);
+    var writer_frame = async writer_loop(&client, allocator);
 
     try await reader_frame;
     try await writer_frame;
